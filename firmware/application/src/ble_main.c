@@ -20,18 +20,27 @@
 #include "dataframe.h"
 #include "hw_connect.h"
 
+#include "keys.h"
+
 #define NRF_LOG_MODULE_NAME ble_main
 #include "nrf_log.h"
 #include "nrf_log_ctrl.h"
 #include "nrf_log_default_backends.h"
 NRF_LOG_MODULE_REGISTER();
 
+#define APP_TIMER_PRESCALER             8                                 /**< Value of the RTC1 PRESCALER register. */
+#define APP_TIMER_OP_QUEUE_SIZE         4                                 /**< Size of timer operation queues. */
+
+#define KEY_CYCLE_PERIOD APP_TIMER_TICKS(3600 * 1000) 
+#define BLE_GAP_ADDR_CYCLE_MODE_NONE 0x00
 
 #define APP_BLE_CONN_CFG_TAG            1                                           /**< A tag identifying the SoftDevice BLE configuration. */
 #define NUS_SERVICE_UUID_TYPE           BLE_UUID_TYPE_VENDOR_BEGIN                  /**< UUID type for the Nordic UART Service (vendor specific). */
 
 #define APP_BLE_OBSERVER_PRIO           3                                           /**< Application's BLE observer priority. You shouldn't need to modify this value. */
 #define APP_ADV_INTERVAL                64                                          /**< The advertising interval (in units of 0.625 ms. This value corresponds to 40 ms). */
+
+#define APP_ADV_HANDLE                  0                                           /**< Advertising handle used to identify an advertising set. */
 
 #define MIN_CONN_INTERVAL               MSEC_TO_UNITS(20, UNIT_1_25_MS)             /**< Minimum acceptable connection interval (20 ms), Connection interval uses 1.25 ms units. */
 #define MAX_CONN_INTERVAL               MSEC_TO_UNITS(75, UNIT_1_25_MS)             /**< Maximum acceptable connection interval (75 ms), Connection interval uses 1.25 ms units. */
@@ -57,6 +66,7 @@ NRF_LOG_MODULE_REGISTER();
 #define ADC_RESULT_IN_MILLI_VOLTS(ADC_VALUE)\
         ((((ADC_VALUE) * ADC_REF_VOLTAGE_IN_MILLIVOLTS) / ADC_RES_12BIT) * ADC_PRE_SCALING_COMPENSATION)
 
+APP_TIMER_DEF(key_cycle_timer);                                                     /**< Key cycle timer. */
 APP_TIMER_DEF(m_battery_timer_id);                                                  /**< Battery measurement timer. */
 BLE_BAS_DEF(m_bas);                                                                 /**< Battery service instance. */
 BLE_NUS_DEF(m_nus, NRF_SDH_BLE_TOTAL_LINK_COUNT);                                   /**< BLE NUS service instance. */
@@ -77,6 +87,95 @@ static ble_uuid_t m_adv_uuids[]          =                                      
 volatile bool g_is_ble_connected = false;
 volatile bool g_is_low_battery_shutdown = false;
 
+uint8_t status_flag = 0;
+uint16_t current_key_index = 0;
+static uint8_t offline_finding_adv_template[] = {
+	0x1e, /* Length (30) */
+	0xff, /* Manufacturer Specific Data (type 0xff) */
+	0x4c, 0x00, /* Company ID (Apple) */
+	0x12, 0x19, /* Offline Finding type and length */
+	0x00, /* State */
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, /* First two bits */
+	0x00, /* Hint (0x00) */
+};
+
+void fill_adv_template_from_key(uint8_t *key) {
+	/* copy last 22 bytes */
+	memcpy(&offline_finding_adv_template[7], &key[6], 22);
+	/* append two bits of public key */
+	offline_finding_adv_template[29] = key[0] >> 6;
+}
+
+
+void set_addr_from_key(uint8_t *key) {
+	/* copy first 6 bytes */
+	/* BLESSED seems to reorder address bytes, so we copy them in reverse order */
+
+    ble_gap_addr_t address = {
+        .addr_type = BLE_GAP_ADDR_TYPE_RANDOM_STATIC
+    };
+
+	address.addr[5] = key[0] | 0b11000000;
+	address.addr[4] = key[1];
+	address.addr[3] = key[2];
+	address.addr[2] = key[3];
+	address.addr[1] = key[4];
+	address.addr[0] = key[5];
+
+    NRF_LOG_DEBUG(
+        "address is: %X:%X:%X:%X:%X:%X\n", 
+        address.addr[5],
+        address.addr[4],
+        address.addr[3],
+        address.addr[2],
+        address.addr[1],
+        address.addr[0]
+        );
+
+    // ret_code_t ret_code = sd_ble_gap_addr_set(BLE_GAP_ADDR_CYCLE_MODE_NONE, &address);
+    ret_code_t ret_code = sd_ble_gap_addr_set(&address);
+    APP_ERROR_CHECK(ret_code);
+}
+
+static void set_key(uint8_t *key){
+    ble_gap_adv_data_t adv_data;
+    memset(&adv_data, 0, sizeof(ble_gap_addr_t));
+    set_addr_from_key(key);
+    fill_adv_template_from_key(key);
+    offline_finding_adv_template[6] = status_flag;
+    // ret_code_t err_code = sd_ble_gap_adv_data_set(offline_finding_adv_template, sizeof(offline_finding_adv_template), 0);
+    // APP_ERROR_CHECK(err_code);
+    adv_data.adv_data.p_data = offline_finding_adv_template;
+    adv_data.adv_data.len = sizeof(offline_finding_adv_template);
+    adv_data.scan_rsp_data.p_data = NULL;
+    adv_data.scan_rsp_data.len = 0;
+    ret_code_t err_code = sd_ble_gap_adv_set_configure(APP_ADV_HANDLE, &adv_data, NULL);
+    APP_ERROR_CHECK(err_code);
+}
+
+void set_key_by_index(uint16_t key_index){
+    set_key(advertisement_keys[key_index]);
+}
+
+void key_cycle_timer_handler(void *context){
+    current_key_index++;
+    current_key_index %= advertisement_key_count;
+    set_key_by_index(current_key_index);
+    NRF_LOG_DEBUG("current key index: %d\n", current_key_index);
+}
+
+void create_keys_cycle_timer(){
+    ret_code_t err_code;
+    //create key cycle timer
+    err_code = app_timer_create(&key_cycle_timer, APP_TIMER_MODE_REPEATED, key_cycle_timer_handler);
+    APP_ERROR_CHECK(err_code);
+    //start key cycle timer
+    err_code = app_timer_start(key_cycle_timer, KEY_CYCLE_PERIOD, NULL);
+    APP_ERROR_CHECK(err_code);
+}
 
 /**@brief Function for the GAP initialization.
  *
@@ -652,6 +751,7 @@ void create_battery_timer(void) {
 void ble_slave_init(void) {
     adc_configure();                    // ADC初始化
     create_battery_timer();             // 创建电池电量更新定时器
+    create_keys_cycle_timer();          // 创建Key切换定时器
     ble_stack_init();                   // BLE协议栈初始化
     gap_params_init();                  // GAP参数初始化
     gatt_init();                        // GATT协议初始化
